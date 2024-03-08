@@ -1,6 +1,6 @@
 /*
 benchmark.c
-Version 2.0
+Version 2.2
 Copyright 2024 rxxuzi
 MIT License
 This program measures the execution time of a given executable file and runs in a Windows environment.
@@ -14,13 +14,17 @@ This program measures the execution time of a given executable file and runs in 
 #define DEFAULT_COUNT 10
 #define MAX_THREADS 16
 #define MAX_PATH 260
-#define VERSION "2.0"
+#define VERSION "2.2"
 
 char* get_time(); // 時刻を文字列で取得。動的にメモリを確保するのでfreeで解放する必要がある。
 void help(char* exepath); // help用
 void getFullPath(char *executableName, char *fullPath, size_t fullPathSize); //　システムに登録された実行ファイルのフルパスを取得する
 int compare(const void *a, const void *b); // 比較関数
-void calculateResults(int size, double *times, double sum, BenchmarkResults *results); // 結果を計算し。構造体に保存する
+
+static BOOL async_flag = FALSE;
+static BOOL output_flag = FALSE; // 出力ファイル用フラグ
+static BOOL hasExtraArgs = FALSE; // -x によるコマンドライン引数のフラグ
+static BOOL isSystemFile = FALSE; // -s による、フラグ
 
 //結果を格納するための構造体 
 typedef struct {
@@ -30,6 +34,8 @@ typedef struct {
     int slowestIndex;    // 最遅の実行時間のインデックス
     double fastest;      // 最速
     double slowest;      // 最遅
+    double* times;       // 時間(配列)
+    int size;            // 配列サイズ
 } BenchmarkResults;
 
 //スレッドの情報.
@@ -38,6 +44,52 @@ typedef struct {
     double* times;
     char commandLine[2048];
 } ThreadData;
+
+// デバッグ情報
+typedef struct {
+    double elapsed_time;
+    char *target_file;
+    char *output_file;
+    BenchmarkResults br;
+    BOOL debug_flag;
+} DebugData;
+
+void calculateResults(int size, double *times, double sum, BenchmarkResults *results) {
+    // 配列のサイズと本体を保存
+    results->size = size;
+    results->times = times;
+
+    // ソートされた配列を作成
+    double *sorted = (double*)malloc(size * sizeof(double));
+    for (int i = 0; i < size; i++) {
+        sorted[i] = times[i];
+    }
+    qsort(sorted, size, sizeof(double), compare);
+
+    // 中央値を計算
+    if (size % 2 == 0) {
+        results->median = (sorted[(size / 2) - 1] + sorted[size / 2]) / 2.0;
+    } else {
+        results->median = sorted[size / 2];
+    }
+
+    // 平均値を計算
+    results->average = sum / size;
+
+    // 最速と最遅のインデックスを見つける
+    int fastIndex = 0, slowIndex = 0;
+    for (int i = 1; i < size; i++) {
+        if (times[i] < times[fastIndex])fastIndex = i;
+        if (times[i] > times[slowIndex]) slowIndex = i;
+    }
+    
+    results->fastestIndex = fastIndex;
+    results->slowestIndex = slowIndex;
+    results->fastest = times[fastIndex];
+    results->slowest = times[slowIndex];
+    
+    free(sorted);
+}
 
 // ファイル出力
 int output(double *times, int size, char *file, char *exefile, double sum) {
@@ -48,8 +100,9 @@ int output(double *times, int size, char *file, char *exefile, double sum) {
     }
 
     fprintf(fp, "Benchmark Test Results for %s \n", exefile);
+    fprintf(fp, "Execution Type: %s\n", async_flag ? "Parallel Processing" : "Sequential Processing");
 
-    char* date = get_time();
+    char *date = get_time();
     fprintf(fp, "%s\n", date);
 
     BenchmarkResults br;
@@ -75,9 +128,8 @@ int output(double *times, int size, char *file, char *exefile, double sum) {
     return 0;    
 }
 
-
 DWORD WINAPI AsyncBenchmark(LPVOID lpParam) {
-    ThreadData* data = (ThreadData*)lpParam;
+    ThreadData* td = (ThreadData*)lpParam;
 
     LARGE_INTEGER start, end, freq;
     QueryPerformanceCounter(&start);
@@ -88,7 +140,7 @@ DWORD WINAPI AsyncBenchmark(LPVOID lpParam) {
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
-    if (!CreateProcess(NULL, data->commandLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+    if (!CreateProcess(NULL, td->commandLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
         printf("CreateProcess failed (%d).\n", GetLastError());
         return 1;
     }
@@ -102,9 +154,35 @@ DWORD WINAPI AsyncBenchmark(LPVOID lpParam) {
     CloseHandle(pi.hThread);
 
     double elapsed = (double)(end.QuadPart - start.QuadPart) / (double)freq.QuadPart;
-    data->times[data->index] = elapsed * 1000.0;
+    td->times[td->index] = elapsed * 1000.0;
 
     return 0;
+}
+
+void show(const DebugData* d) {
+    puts("\nBenchmark: ");
+    for (size_t i = 0; i < d->br.size; i ++) {
+        printf("Run %03d: %f ms\n", i + 1, d->br.times[i]);
+    }
+
+    if (d->debug_flag) {
+        printf("-----Detailed Results-----\n");
+        printf("Average : %7f ms\n", d->br.average);
+        printf("Median  : %7f ms\n", d->br.median);
+        printf("Fastest : %7f ms Run(%03d)\n",d->br.fastest, d->br.fastestIndex + 1);
+        printf("Slowest : %7f ms Run(%03d)\n",d->br.slowest, d->br.slowestIndex + 1);
+        printf("Execution Type: %s\n", async_flag ? "(Parallel)" : "(Sequential)");
+        printf("Target File   : %s\n" , d->target_file);
+        printf("Total Runs    : %d\n" , d->br.size);
+        printf("Elapsed Time  : %7f ms \n", d->elapsed_time);
+    } else {
+        printf("-----Summary Results-----\n");
+        printf("Average: %lf ms\n", d->br.average);
+        printf("Median : %lf ms\n", d->br.median);
+    }
+
+    if(output_flag) printf("Output -> %s", d->output_file);
+
 }
 
 int main(int argc, char *argv[]) {
@@ -116,10 +194,13 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[1] , "-h") == 0 || strcmp(argv[1] , "--help") == 0 ) {
         help(argv[0]);
         return 0;
-    } else if (strcmp(argv[1] , "-v") == 0) {
+    } else if (strcmp(argv[1] , "-v") == 0 || strcmp(argv[1] , "--version") == 0) {
         printf("Version : %s" , VERSION);
         return 0;
     }
+
+    DebugData dd;
+    dd.debug_flag = FALSE;
 
     char *executable = argv[1]; //実行ファイル
     char *target = argv[1]; // 実行するターゲット
@@ -130,10 +211,10 @@ int main(int argc, char *argv[]) {
 
     char extraArgs[1024] = {0}; // 実行ファイルに渡す追加の引数を格納
 
-    BOOL output_flag = FALSE; // 出力ファイル用フラグ
-    BOOL hasExtraArgs = FALSE; // -x によるコマンドライン引数のフラグ
-    BOOL isSystemFile = FALSE; // -s による、フラグ
-    BOOL async_flag = FALSE; // 並列処理フラグ
+    async_flag = FALSE; // 並列処理フラグ
+
+    LARGE_INTEGER frequency;    // タイマーの周波数
+    LARGE_INTEGER sd, ed;       // 開始時刻と終了時刻
     
     // オプションを確認
     for(int i = 2; i < argc; i++) {
@@ -153,17 +234,8 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "-x") == 0 && i + 1 < argc) {
             // -xオプション
             char* x_arg = argv[i + 1];
-            size_t arg_len = strlen(x_arg);
-            if (x_arg[0] == '\"' && x_arg[arg_len - 1] == '\"') {
-                // クォートで囲まれている場合、先頭と末尾のクォートを除去
-                x_arg[arg_len - 1] = '\0'; // 末尾のクォートを除去
-                strncpy(extraArgs, x_arg + 1, sizeof(extraArgs) - 1);
-                hasExtraArgs = TRUE;
-            } else {
-                printf("Error: -x option's argument must be enclosed in quotes.\n");
-                return 1; 
-            }
-            i++;
+            strncpy(extraArgs, x_arg, sizeof(extraArgs) - 1);
+            hasExtraArgs = TRUE;
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
             // -sオプション
             isSystemFile = TRUE;
@@ -185,9 +257,17 @@ int main(int argc, char *argv[]) {
                 i++; 
             }
             count = num_of_threads;
+        } else if (strcmp(argv[i], "-d") == 0){
+            dd.debug_flag = TRUE;
         }
         
     }
+
+    dd.output_file = output_file;
+
+    // タイマーの周波数を取得
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&sd);
 
     // ファイルが存在するか確認。
     WIN32_FIND_DATA findFileData;
@@ -197,7 +277,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     FindClose(handle);
-
     char commandLine[2048]; // コマンドライン全体を格納
 
     if (isSystemFile) {
@@ -227,14 +306,14 @@ int main(int argc, char *argv[]) {
         while (total_executed < count) {
             int current_batch = min(MAX_THREADS, count - total_executed); // 現在のバッチで実行する回数
             HANDLE threads[current_batch]; // 現在のバッチのスレッドハンドル
-            ThreadData data[current_batch]; // 現在のバッチのスレッドデータ
+            ThreadData td[current_batch]; // 現在のバッチのスレッドデータ
 
             for (int i = 0; i < current_batch; i++) {
-                data[i].index = total_executed + i;
-                data[i].times = times;
-                strcpy(data[i].commandLine, commandLine);
+                td[i].index = total_executed + i;
+                td[i].times = times;
+                strcpy(td[i].commandLine, commandLine);
                 
-                threads[i] = CreateThread(NULL, 0, AsyncBenchmark, &data[i], 0, NULL);
+                threads[i] = CreateThread(NULL, 0, AsyncBenchmark, &td[i], 0, NULL);
                 if (threads[i] == NULL) {
                     printf("CreateThread failed (%d).\n", GetLastError());
                     return 1;
@@ -294,19 +373,17 @@ int main(int argc, char *argv[]) {
             total_time += times[i];        
         }
     }
-    
 
-    puts("\nBenchmark: ");
-    for (size_t i = 0; i < count; i++) {
-        printf("Run %03d: %f ms\n", i + 1, times[i]);
-    }
+    // 関数実行後の時刻を取得
+    QueryPerformanceCounter(&ed);    
     
     BenchmarkResults br;
     calculateResults(count, times, total_time, &br);
+    dd.elapsed_time = (double)(ed.QuadPart - sd.QuadPart) * 1000.0 / frequency.QuadPart;
+    dd.target_file = target;
+    dd.br = br;
 
-    printf("Average: %f ms\n", br.average);
-    printf("Median : %f ms\n", br.median);
-    
+    show(&dd);// 結果を表示
 
     if (output_flag) {
         if(output(times, count, output_file, target, total_time)){
@@ -326,9 +403,10 @@ void help(char *exepath) {
     printf("                  You can specify a range from 1 to 100. Note: Cannot be used with -a option.\n");
     printf("  -a <count>    : Executes the specified executable file or command the number of times specified in parallel.\n");
     printf("                  Specifies the number of parallel executions. Note: Cannot be used with -t option.\n");
+    printf("  -d            : Displays detailed results. This option provides more comprehensive information about the benchmark results.\n");
     printf("  -o <filename> : Saves the benchmark test results to the specified file. If no filename is specified,\n");
     printf("                  it will be saved to '%s'.\n", DEFAULT_OUTPUT_FILE);
-    printf("  -x <\"option\"> : Passes additional command-line options to the executable file or command. The option should be enclosed in quotes.\n");
+    printf("  -x <\"args\">   : Passes additional command-line options to the executable file or command. The option should be enclosed in quotes.\n");
     printf("  -s <filename> : Specifies that the executable is a system-registered executable. Use this option to run executables located in system paths.\n");
     printf("  -h            : Displays this help message.\n");
     printf("  -v            : Display this version.\n");
@@ -342,39 +420,6 @@ void help(char *exepath) {
     printf("  %s example.exe -a 30 -o result.txt\n", exe);
     printf("    -> Executes 'example.exe' 30 times in parallel and saves the results to 'result.txt'.\n");
     printf("\nNote: The -a and -t options are mutually exclusive and cannot be used together.\n");
-}
-
-void calculateResults(int size, double *times, double sum, BenchmarkResults *results) {
-    // ソートされた配列を作成
-    double *sorted = (double*)malloc(size * sizeof(double));
-    for (int i = 0; i < size; i++) {
-        sorted[i] = times[i];
-    }
-    qsort(sorted, size, sizeof(double), compare);
-
-    // 中央値を計算
-    if (size % 2 == 0) {
-        results->median = (sorted[(size / 2) - 1] + sorted[size / 2]) / 2.0;
-    } else {
-        results->median = sorted[size / 2];
-    }
-
-    // 平均値を計算
-    results->average = sum / size;
-
-    // 最速と最遅のインデックスを見つける
-    int fastIndex = 0, slowIndex = 0;
-    for (int i = 1; i < size; i++) {
-        if (times[i] < times[fastIndex])fastIndex = i;
-        if (times[i] > times[slowIndex]) slowIndex = i;
-    }
-    
-    results->fastestIndex = fastIndex;
-    results->slowestIndex = slowIndex;
-    results->fastest = times[fastIndex];
-    results->slowest = times[slowIndex];
-    
-    free(sorted);
 }
 
 //時刻を Y-M-D H:M:S形式で取得する。
